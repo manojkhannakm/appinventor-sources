@@ -2808,6 +2808,10 @@ public interface OdeMessages extends Messages {
   @Description("")
   String UseFrontProperties();
 
+  @DefaultMessage("UseCameraApp")
+  @Description("")
+  String UseCameraAppProperties();
+
   @DefaultMessage("UseGPS")
   @Description("")
   String UseGPSProperties();

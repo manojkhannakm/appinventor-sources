@@ -6,6 +6,10 @@
 
 package com.google.appinventor.components.runtime;
 
+import android.graphics.SurfaceTexture;
+import android.os.Build;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import com.google.appinventor.components.annotations.DesignerProperty;
 import com.google.appinventor.components.annotations.DesignerComponent;
 import com.google.appinventor.components.annotations.PropertyCategory;
@@ -28,6 +32,8 @@ import android.provider.MediaStore;
 import android.util.Log;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.Date;
 
 /**
@@ -45,13 +51,14 @@ import java.util.Date;
    nonVisible = true,
    iconName = "images/camera.png")
 @SimpleObject
-@UsesPermissions(permissionNames = "android.permission.WRITE_EXTERNAL_STORAGE, android.permission.READ_EXTERNAL_STORAGE")
+@UsesPermissions(permissionNames = "android.permission.CAMERA, android.permission.WRITE_EXTERNAL_STORAGE, android.permission.READ_EXTERNAL_STORAGE")
 public class Camera extends AndroidNonvisibleComponent
-    implements ActivityResultListener, Component {
+    implements ActivityResultListener, Component, OnResumeListener, OnPauseListener, android.hardware.Camera.PictureCallback {
 
   private static final String CAMERA_INTENT = "android.media.action.IMAGE_CAPTURE";
   private static final String CAMERA_OUTPUT = "output";
   private final ComponentContainer container;
+  private android.hardware.Camera camera;
   private Uri imageFile;
 
   /* Used to identify the call to startActivityForResult. Will be passed back
@@ -60,6 +67,8 @@ public class Camera extends AndroidNonvisibleComponent
 
   // whether to open into the front-facing camera
   private boolean useFront;
+
+  private boolean useCameraApp = true;
 
   /**
    * Creates a Camera component.
@@ -71,6 +80,11 @@ public class Camera extends AndroidNonvisibleComponent
   public Camera(ComponentContainer container) {
     super(container.$form());
     this.container = container;
+
+    openCamera();
+
+    form.registerForOnResume(this);
+    form.registerForOnPause(this);
 
     // Default property values
     UseFront(false);
@@ -109,43 +123,52 @@ public class Camera extends AndroidNonvisibleComponent
    */
   @SimpleFunction
   public void TakePicture() {
-    Date date = new Date();
-    String state = Environment.getExternalStorageState();
+    if (useCameraApp) {
+      Date date = new Date();
+      String state = Environment.getExternalStorageState();
 
-    if (Environment.MEDIA_MOUNTED.equals(state)) {
-      Log.i("CameraComponent", "External storage is available and writable");
+      if (Environment.MEDIA_MOUNTED.equals(state)) {
+        Log.i("CameraComponent", "External storage is available and writable");
 
-      imageFile = Uri.fromFile(new File(Environment.getExternalStorageDirectory(),
-        "/Pictures/app_inventor_" + date.getTime()
-        + ".jpg"));
+        imageFile = Uri.fromFile(new File(Environment.getExternalStorageDirectory(),
+            "/Pictures/app_inventor_" + date.getTime()
+                + ".jpg"));
 
-      ContentValues values = new ContentValues();
-      values.put(MediaStore.Images.Media.DATA, imageFile.getPath());
-      values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-      values.put(MediaStore.Images.Media.TITLE, imageFile.getLastPathSegment());
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Images.Media.DATA, imageFile.getPath());
+        values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        values.put(MediaStore.Images.Media.TITLE, imageFile.getLastPathSegment());
 
-      if (requestCode == 0) {
-        requestCode = form.registerForActivityResult(this);
+        if (requestCode == 0) {
+          requestCode = form.registerForActivityResult(this);
+        }
+
+        Uri imageUri = container.$context().getContentResolver().insert(
+            MediaStore.Images.Media.INTERNAL_CONTENT_URI, values);
+        Intent intent = new Intent(CAMERA_INTENT);
+        intent.putExtra(CAMERA_OUTPUT, imageUri);
+
+        // NOTE: This uses an undocumented, testing feature (CAMERA_FACING).
+        // It may not work in the future.
+        if (useFront) {
+          intent.putExtra("android.intent.extras.CAMERA_FACING", 1);
+        }
+
+        container.$context().startActivityForResult(intent, requestCode);
+      } else if (Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
+        form.dispatchErrorOccurredEvent(this, "TakePicture",
+            ErrorMessages.ERROR_MEDIA_EXTERNAL_STORAGE_READONLY);
+      } else {
+        form.dispatchErrorOccurredEvent(this, "TakePicture",
+            ErrorMessages.ERROR_MEDIA_EXTERNAL_STORAGE_NOT_AVAILABLE);
       }
-
-      Uri imageUri = container.$context().getContentResolver().insert(
-        MediaStore.Images.Media.INTERNAL_CONTENT_URI, values);
-      Intent intent = new Intent(CAMERA_INTENT);
-      intent.putExtra(CAMERA_OUTPUT, imageUri);
-
-      // NOTE: This uses an undocumented, testing feature (CAMERA_FACING).
-      // It may not work in the future.
-      if (useFront) {
-        intent.putExtra("android.intent.extras.CAMERA_FACING", 1);
-      }
-
-      container.$context().startActivityForResult(intent, requestCode);
-    } else if (Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
-      form.dispatchErrorOccurredEvent(this, "TakePicture",
-          ErrorMessages.ERROR_MEDIA_EXTERNAL_STORAGE_READONLY);
     } else {
-      form.dispatchErrorOccurredEvent(this, "TakePicture",
-          ErrorMessages.ERROR_MEDIA_EXTERNAL_STORAGE_NOT_AVAILABLE);
+      if (camera != null) {
+        camera.takePicture(null, null, this);
+      } else {
+        form.dispatchErrorOccurredEvent(this, "AutoTakePicture",
+            ErrorMessages.ERROR_CAMERA_CANNOT_CONNECT);
+      }
     }
   }
 
@@ -212,5 +235,106 @@ public class Camera extends AndroidNonvisibleComponent
   @SimpleEvent
   public void AfterPicture(String image) {
     EventDispatcher.dispatchEvent(this, "AfterPicture", image);
+  }
+
+  /**
+   * Returns true if the default camera app should be used
+   *
+   * @return {@code true} if the default camera app should be used, {@code false} to take the picture directly
+   */
+  @SimpleProperty(category = PropertyCategory.BEHAVIOR)
+  public boolean UseCameraApp() {
+    return useCameraApp;
+  }
+
+  /**
+   * Specifies whether to use the default camera app
+   */
+  @DesignerProperty(editorType = PropertyTypeConstants.PROPERTY_TYPE_BOOLEAN, defaultValue = "True")
+  @SimpleProperty(description = "Specifies whether to use the default camera app or "
+      + "take the picture directly without any preview.")
+  public void UseCameraApp(boolean use) {
+    useCameraApp = use;
+  }
+
+  @Override
+  public void onResume() {
+    openCamera();
+  }
+
+  @Override
+  public void onPause() {
+    closeCamera();
+  }
+
+  @Override
+  public void onPictureTaken(byte[] data, android.hardware.Camera camera) {
+    String state = Environment.getExternalStorageState();
+    if (Environment.MEDIA_MOUNTED.equals(state)) {
+      File file = new File(Environment.getExternalStorageDirectory(),
+          "/Pictures/app_inventor_" + new Date().getTime()
+              + ".jpg");
+      file.getParentFile().mkdirs();
+
+      try {
+        FileOutputStream outputStream = new FileOutputStream(file);
+        outputStream.write(data);
+        outputStream.close();
+
+        AfterPicture(file.toString());
+      } catch (IOException e) {
+        Log.i("CameraComponent", "Could not write image");
+      }
+    } else if (Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
+      form.dispatchErrorOccurredEvent(this, "onPictureTaken",
+          ErrorMessages.ERROR_MEDIA_EXTERNAL_STORAGE_READONLY);
+    } else {
+      form.dispatchErrorOccurredEvent(this, "onPictureTaken",
+          ErrorMessages.ERROR_MEDIA_EXTERNAL_STORAGE_NOT_AVAILABLE);
+    }
+  }
+
+  /**
+   * Opens the Camera for taking pictures instantly. If failed to instantiate
+   * sets the camera to null.
+   */
+  private void openCamera() {
+    try {
+      camera = android.hardware.Camera.open();
+    } catch (Exception e) {
+    }
+
+    if (camera == null) {
+      Log.i("CameraComponent", "Camera not found");
+      return;
+    }
+
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.HONEYCOMB) {
+      SurfaceHolder holder = new SurfaceView(container.$context()).getHolder();
+      holder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS);
+      try {
+        camera.setPreviewDisplay(holder);
+        camera.startPreview();
+      } catch (IOException e) {
+        camera = null;
+      }
+    } else {
+      try {
+        camera.setPreviewTexture(new SurfaceTexture(0));
+        camera.startPreview();
+      } catch (IOException e) {
+        camera = null;
+      }
+    }
+  }
+
+  /**
+   * Closes the camera so that other applications can take control of it.
+   */
+  private void closeCamera() {
+    if (camera != null) {
+      camera.stopPreview();
+      camera.release();
+    }
   }
 }
